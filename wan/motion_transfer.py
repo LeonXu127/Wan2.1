@@ -8,133 +8,27 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
-import numpy as np
-import decord
 from einops import rearrange
+import time
 
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp
+import torch.optim
 import torch.distributed as dist
+import torch.nn.functional as F
 from tqdm import tqdm
-import torch.nn as nn
 
 from .distributed.fsdp import shard_model
-from .modules.model import WanModel, rope_apply
-from .modules.attention import flash_attention
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
+from .modules.model import WanModel
 from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from motion_transfer.utils import video_to_tensor
-
-
-class ModifiedSelfAttention(nn.Module):
-    """修改后的注意力模块，用于提取query和key特征"""
-    
-    def __init__(self, original_attn, layer_idx):
-        super().__init__()
-        self.original_attn = original_attn
-        self.layer_idx = layer_idx
-        self.save_features = False
-        
-        # 直接从原始注意力模块获取属性
-        self.dim = original_attn.dim
-        self.num_heads = original_attn.num_heads
-        self.head_dim = original_attn.head_dim
-        self.window_size = original_attn.window_size
-        self.qk_norm = original_attn.qk_norm
-        self.eps = original_attn.eps
-        
-        # 直接使用原始注意力模块的层
-        self.q = original_attn.q
-        self.k = original_attn.k
-        self.v = original_attn.v
-        self.o = original_attn.o
-        self.norm_q = original_attn.norm_q
-        self.norm_k = original_attn.norm_k
-        
-        # 存储特征的字典
-        self.features_dict = None
-    
-    def forward(self, x, seq_lens, grid_sizes, freqs):
-        """
-        处理自注意力并提取特征
-        
-        Args:
-            x (Tensor): 形状 [B, L, C]
-            seq_lens (Tensor): 形状 [B]
-            grid_sizes (Tensor): 形状 [B, 3]
-            freqs (Tensor): Rope频率，形状 [1024, C / num_heads / 2]
-        """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-
-        # 计算query, key, value
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
-        
-        # 在启用特征保存时保存query和key
-        if self.save_features:
-            if self.features_dict is not None:
-                self.features_dict["query"][self.layer_idx] = q.detach().cpu()
-                self.features_dict["key"][self.layer_idx] = k.detach().cpu()
-        
-        # 应用rope并计算注意力
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
-
-        # 输出
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
-    
-    def enable_save_features(self, features_dict):
-        """启用特征保存"""
-        self.save_features = True
-        self.features_dict = features_dict
-        
-    def disable_save_features(self):
-        """禁用特征保存"""
-        self.save_features = False
-
-class ModifiedT2VCrossAttention(ModifiedSelfAttention):
-
-    def forward(self, x, context, context_lens):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
-        """
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-
-        # 在启用特征保存时保存query和key
-        if self.save_features:
-            if self.features_dict is not None:
-                self.features_dict["query"][self.layer_idx] = q.detach().cpu()
-                self.features_dict["key"][self.layer_idx] = k.detach().cpu()
-
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
-
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
-
+from motion_transfer.utils import *
+from .modules.modified_attention import ModifiedSelfAttention, ModifiedCrossAttention
 
 class WanMT:
-
     def __init__(
         self,
         config,
@@ -178,6 +72,10 @@ class WanMT:
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
         self.extract_timestep = config.extract_timestep
+        self.extract_layer_id = config.extract_layer_id
+        self.optimize_steps = config.optimize_steps
+        self.optimize_timestep_ratio = config.optimize_timestep_ratio
+        self.optimize_lr = config.optimize_lr
 
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
@@ -228,48 +126,34 @@ class WanMT:
         # 设置特征文件名
         video_name = os.path.splitext(os.path.basename(video_name))[0]
         self.feature_filename = f"{video_name}.pt"
-        
+        self.motion_flow_filename = f"{video_name}_flow.pt"
         # 收集的特征
-        self.ref_ft = {}
-    
-    def _modify_attention_modules(self):
-        """修改模型的注意力模块，以便在扩散过程中提取特征"""
-        # 为所有层创建特征字典
-        num_layers = len(self.model.blocks)
         self.ref_ft = {
-            "query": {i: None for i in range(num_layers)},
-            "key": {i: None for i in range(num_layers)}
+            "query": {i: None for i in range(len(self.model.blocks))},
+            "key": {i: None for i in range(len(self.model.blocks))}
         }
-        
+    
+    def _modify_attention_modules(self, reference=False):
+        """修改模型的注意力模块，以便在扩散过程中提取特征"""
         for i, block in enumerate(self.model.blocks):
-            # # 保存原始self_attn模块的reference
-            # original_attn = block.self_attn
-            # # 创建修改后的注意力模块
-            # modified_attn = ModifiedSelfAttention(
-            #     original_attn=original_attn,
-            #     layer_idx=i
-            # )
-            # # 替换原始注意力模块
-            # block.self_attn = modified_attn
-            # 保存原始cross_attn模块的reference
-            original_attn = block.cross_attn
-            # 创建修改后的注意力模块
-            modified_attn = ModifiedT2VCrossAttention(
-                original_attn=original_attn,
-                layer_idx=i
-            )
-            # 替换原始注意力模块
-            block.cross_attn = modified_attn
+            if reference or i == self.config.extract_layer_id:
+                # 保存原始self_attn模块的reference
+                original_attn = block.self_attn
+                # 创建修改后的注意力模块
+                modified_attn = ModifiedSelfAttention(
+                    original_attn=original_attn,
+                    layer_idx=i
+                )
+                # 替换原始注意力模块
+                block.self_attn = modified_attn
             
     def _restore_attention_modules(self):
         """恢复原始的注意力模块"""
         for block in self.model.blocks:
-            # if isinstance(block.self_attn, ModifiedSelfAttention):
-            #     block.self_attn = block.self_attn.original_attn
-            if isinstance(block.cross_attn, ModifiedT2VCrossAttention):
-                block.cross_attn = block.cross_attn.original_attn
+            if isinstance(block.self_attn, ModifiedSelfAttention):
+                block.self_attn = block.self_attn.original_attn
     
-    def load_features(self, feature_path=None):
+    def load_ref_features(self, feature_path=None, flow_path=None):
         """
         加载保存的特征
         
@@ -280,11 +164,10 @@ class WanMT:
         Returns:
             dict: 包含query和key的字典
         """
-        self.ref_ft = torch.load(feature_path)
-        print(f"feature_shape: {self.ref_ft['query'][0].shape}")
-        return self.ref_ft
+        # self.ref_ft = torch.load(feature_path)
+        self.ref_motion_flow = torch.load(flow_path).cpu()
     
-    def save_features(self, feature_path=None):
+    def save_ref_features(self, feature_path=None):
         """
         保存提取的特征
         
@@ -292,12 +175,15 @@ class WanMT:
             feature_path (str, optional): 
                 保存特征的路径，如果为None，使用默认路径
         """
-        if feature_path is None:
-            feature_path = os.path.join(self.save_path, self.feature_filename)
+        feature_path = os.path.join(self.save_path, self.feature_filename)
+        flow_path = os.path.join(self.save_path, self.motion_flow_filename)
+
         print(f"feature_shape: {self.ref_ft['query'][0].shape}")
         torch.save(self.ref_ft, feature_path)
-        logging.info(f"特征已保存到 {feature_path}")
+        torch.save(self.ref_motion_flow, flow_path)
+        logging.info(f"特征已保存到 {feature_path} 和 {flow_path}")
 
+    @torch.no_grad()
     def extract_features(self,
                  input_prompt,
                  input_video_path,
@@ -337,13 +223,6 @@ class WanMT:
             offload_model (`bool`, *optional*, defaults to True):
                 如果为True，在生成过程中将模型卸载到CPU以节省VRAM
         """
-        # 检查特征文件是否已存在
-        feature_path = os.path.join(self.save_path, self.feature_filename)
-        if os.path.exists(feature_path):
-            logging.info(f"特征文件 {feature_path} 已存在，直接加载")
-            self.load_features(feature_path)
-            return
-            
         # 处理视频文件，返回指定帧数的视频张量
         input_video = video_to_tensor(input_video_path, frame_num, size, self.device)
             
@@ -356,11 +235,24 @@ class WanMT:
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
                           H // self.vae_stride[1],
                           W // self.vae_stride[2])
+        self.latent_shape = (
+            target_shape[1] // self.patch_size[0],
+            target_shape[2] // self.patch_size[1],
+            target_shape[3] // self.patch_size[2]
+        )
 
         seq_len = math.ceil((target_shape[2] * target_shape[3]) /
                              (self.patch_size[1] * self.patch_size[2]) *
                              target_shape[1] / self.sp_size) * self.sp_size
 
+        # 检查特征文件是否已存在
+        feature_path = os.path.join(self.save_path, self.feature_filename)
+        flow_path = os.path.join(self.save_path, self.motion_flow_filename)
+        if os.path.exists(feature_path):
+            logging.info(f"特征文件 {feature_path} 已存在，直接加载")
+            self.load_ref_features(feature_path, flow_path)
+            return
+        
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
@@ -390,10 +282,10 @@ class WanMT:
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
         # 修改注意力模块以提取特征
-        self._modify_attention_modules()
+        self._modify_attention_modules(reference=True)
 
         # 评估模式
-        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        with amp.autocast(device_type='cuda', dtype=self.param_dtype), torch.no_grad(), no_sync():
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
@@ -426,36 +318,114 @@ class WanMT:
             
             # 启用特征保存
             for block in self.model.blocks:
-                # if isinstance(block.self_attn, ModifiedSelfAttention):
-                #     block.self_attn.enable_save_features(self.ref_ft)
-                if isinstance(block.cross_attn, ModifiedT2VCrossAttention):
-                    block.cross_attn.enable_save_features(self.ref_ft)
+                if isinstance(block.self_attn, ModifiedSelfAttention):
+                    block.self_attn.enable_save_features(self.ref_ft)
             
             # 带条件前向传播，提取特征
             self.model.to(self.device)
             arg_c = {'context': context, 'seq_len': seq_len}
             _ = self.model(
                 [latent], t=timestep, **arg_c)[0]
+            # 计算motion flow
+            start_time = time.time()
+            self.ref_motion_flow = cal_motion_flow_selectedhead(
+                self.ref_ft['query'][self.extract_layer_id],
+                self.ref_ft['key'][self.extract_layer_id],
+                self.latent_shape,
+                reference=True
+            )
+            end_time = time.time()
+            logging.info(f"cal_motion_flow time: {end_time - start_time}s")
             
             # 禁用特征保存
             for block in self.model.blocks:
-                # if isinstance(block.self_attn, ModifiedSelfAttention):
-                #     block.self_attn.disable_save_features()
-                if isinstance(block.cross_attn, ModifiedT2VCrossAttention):
-                    block.cross_attn.disable_save_features()
+                if isinstance(block.self_attn, ModifiedSelfAttention):
+                    block.self_attn.disable_save_features()
 
         # 恢复原始注意力模块
         self._restore_attention_modules()
         
         # 保存提取的特征
-        self.save_features()
+        self.save_ref_features()
         
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
+
+    
+    def optimize_latents(
+        self,
+        latents: list[torch.Tensor],
+        t: torch.Tensor,
+        arg_c: dict,
+    ):
+        torch_dtype = latents[0].dtype
+        extract_layer_id = self.config.extract_layer_id
+        cur_ft = {
+            "query": {i: None for i in range(len(self.model.blocks))},
+            "key": {i: None for i in range(len(self.model.blocks))}
+        }
+        # 启动特征保存
+        for i, block in enumerate(self.model.blocks):
+            if i == extract_layer_id and isinstance(block.self_attn, ModifiedSelfAttention):
+                block.self_attn.enable_save_features(cur_ft)
+
+        with torch.enable_grad():
+            latents = [x.clone().detach().requires_grad_(True) for x in latents]
+
+            optimizer = torch.optim.AdamW(latents, lr=self.optimize_lr)
+
+            log_file = open("motion_transfer/logs/motion_transfer_loss.txt", "a")
+            log_file.write(f"Timestep: {t.item()}\n")
+
+            for i in range(self.optimize_steps):
+                optimizer.zero_grad()
+                self.model.to(self.device)
+                self.model.gradient_checkpointing = True
+
+                # with torch.autocast(device_type = "cuda", dtype=torch.bfloat16):
+                _ = self.model(
+                    latents,
+                    t=t,
+                    **arg_c
+                )[0]
+
+                start_time = time.time()
+                cur_flow = cal_motion_flow_selectedhead(
+                    cur_ft['query'][extract_layer_id],
+                    cur_ft['key'][extract_layer_id],
+                    self.latent_shape,
+                    reference=False
+                )
+                end_time = time.time()
+                print(f"cal_motion_flow time cost: {end_time - start_time}s")
+
+                # print(f"cur_flow.shape: {cur_flow.shape}, ref_motion_flow.shape: {self.ref_motion_flow.shape}")
+                # input("check cur_flow and ref_motion_flow")
+                loss = F.mse_loss(cur_flow, self.ref_motion_flow.to(cur_flow.device).to(dtype=cur_flow.dtype))
+                print(f"loss in step {i}: {loss.item()}")
+                # 将loss写入文件
+                log_file.write(f"Step {i}, Loss: {loss.item()}\n")
+                log_file.flush()  # 确保立即写入文件
+
+                start_time = time.time()
+                loss.backward()
+                end_time = time.time()
+                print(f"Backpropagation time cost: {end_time - start_time}s")
+                optimizer.step()
         
+        # 关闭日志文件
+        log_file.write("\n")
+        log_file.close()      
+        # 关闭特征保存
+        for i, block in enumerate(self.model.blocks):
+            if i == extract_layer_id and isinstance(block.self_attn, ModifiedSelfAttention):
+                block.self_attn.disable_save_features()
+
+        return [x.detach().to(torch_dtype) for x in latents]
+
 
     def generate(self,
                  input_prompt,
@@ -504,3 +474,134 @@ class WanMT:
                 - H: Frame height (from size)
                 - W: Frame width from size)
         """
+        # preprocess
+        F = frame_num
+        target_shape = (
+            self.vae.model.z_dim, 
+            (F - 1) // self.vae_stride[0] + 1,
+            size[1] // self.vae_stride[1],
+            size[0] // self.vae_stride[2]
+        )
+
+        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
+                            (self.patch_size[1] * self.patch_size[2]) *
+                            target_shape[1] / self.sp_size) * self.sp_size
+
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+        seed_g = torch.Generator(device=self.device)
+        seed_g.manual_seed(seed)
+
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            context = self.text_encoder([input_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context = [t.to(self.device) for t in context]
+            context_null = [t.to(self.device) for t in context_null]
+
+        noise = [
+            torch.randn(
+                target_shape[0],
+                target_shape[1],
+                target_shape[2],
+                target_shape[3],
+                dtype=torch.float32,
+                device=self.device,
+                generator=seed_g)
+        ]
+
+        @contextmanager
+        def noop_no_sync():
+            yield
+
+        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+
+        # evaluation mode
+        with amp.autocast(device_type='cuda', dtype=self.param_dtype), torch.no_grad(), no_sync():
+            if sample_solver == 'unipc':
+                sample_scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sample_scheduler.set_timesteps(
+                    sampling_steps, device=self.device, shift=shift)
+                timesteps = sample_scheduler.timesteps
+            elif sample_solver == 'dpm++':
+                sample_scheduler = FlowDPMSolverMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                timesteps, _ = retrieve_timesteps(
+                    sample_scheduler,
+                    device=self.device,
+                    sigmas=sampling_sigmas)
+            else:
+                raise NotImplementedError("Unsupported solver.")
+
+            # sample videos
+            latents = noise
+
+            arg_c = {'context': context, 'seq_len': seq_len}
+            arg_null = {'context': context_null, 'seq_len': seq_len}
+
+            # 修改注意力模块以提取特征
+            self._modify_attention_modules(reference=False)
+            # 优化latents的timestep的index
+            optimize_idx = len(timesteps) * self.optimize_timestep_ratio
+            logging.info(f"optimize_idx and len(timesteps): {optimize_idx}, {len(timesteps)}")
+            for i, t in enumerate(tqdm(timesteps)):
+                latent_model_input = latents
+                timestep = [t]
+                timestep = torch.stack(timestep)
+
+                if i < optimize_idx:
+                    logging.info(f"optimizing latents at timestep {t}")
+                    # input("optimizing latents at timestep {t}")
+                    latent_model_input = self.optimize_latents(
+                        latents=latent_model_input,
+                        t=timestep,
+                        arg_c=arg_c,
+                    )
+                if i == optimize_idx:
+                    self._restore_attention_modules()
+
+                self.model.to(self.device)
+                noise_pred_cond = self.model(
+                    latent_model_input, t=timestep, **arg_c)[0]
+                noise_pred_uncond = self.model(
+                    latent_model_input, t=timestep, **arg_null)[0]
+
+                noise_pred = noise_pred_uncond + guide_scale * (
+                    noise_pred_cond - noise_pred_uncond)
+
+                temp_x0 = sample_scheduler.step(
+                    noise_pred.unsqueeze(0),
+                    t,
+                    latents[0].unsqueeze(0),
+                    return_dict=False,
+                    generator=seed_g)[0]
+                latents = [temp_x0.squeeze(0)]
+
+            x0 = latents
+            if offload_model:
+                self.model.cpu()
+                torch.cuda.empty_cache()
+            if self.rank == 0:
+                videos = self.vae.decode(x0)
+
+        del noise, latents
+        del sample_scheduler
+        if offload_model:
+            gc.collect()
+            torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+
+        return videos[0] if self.rank == 0 else None

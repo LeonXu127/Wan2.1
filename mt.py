@@ -122,16 +122,28 @@ def _parse_args():
         help="是否对DiT使用FSDP。"
     )
     parser.add_argument(
-        "--save_dir",
+        "--save_folder",
         type=str,
-        default="motion_transfer/reference",
-        help="保存提取特征的目录。"
+        default=None,
+        help="保存特征的文件夹。"
+    )
+    parser.add_argument(
+        "--save_file",
+        type=str,
+        default=None,
+        help="视频保存路径。"
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        default="一只猫在草地上奔跑",
-        help="用于生成视频的提示。"
+        default="",
+        help="用于生成视频的prompt。"
+    )
+    parser.add_argument(
+        "--reference_prompt",
+        type=str,
+        default="",
+        help="参考视频的prompt。"
     )
     parser.add_argument(
         "--video_path",
@@ -296,7 +308,7 @@ def generate(args):
     # 提取特征
     logging.info(f"开始提取特征，目标timestep: {cfg.extract_timestep}...")
     wan_mt.extract_features(
-        args.prompt,
+        args.reference_prompt,
         args.video_path,
         size=SIZE_CONFIGS[args.size],
         frame_num=args.frame_num,
@@ -309,8 +321,8 @@ def generate(args):
     )
 
     if rank == 0:
-        logging.info(f"特征提取完成，保存为: {os.path.join(wan_mt.save_path, wan_mt.feature_filename)}")
-    input("Finished feature extraction...")
+        logging.info(f"特征提取完成，路径为: {os.path.join(wan_mt.save_path, wan_mt.feature_filename)}")
+    # input("Finished feature extraction...")
 
     logging.info(
         f"Generating video ...")
@@ -332,7 +344,10 @@ def generate(args):
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
                                                                      "_")[:50]
             suffix = '.png' if "t2i" in args.task else '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            if args.save_folder is not None:
+                args.save_file = f"{args.save_folder}/{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            else:
+                args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
 
         logging.info(f"Saving generated video to {args.save_file}")
         cache_video(

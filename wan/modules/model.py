@@ -1,11 +1,13 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+from typing import Dict, Any
 
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers.utils import is_torch_version
 
 from .attention import flash_attention
 
@@ -378,6 +380,8 @@ class WanModel(ModelMixin, ConfigMixin):
     ]
     _no_split_modules = ['WanAttentionBlock']
 
+    _supports_gradient_checkpointing = True
+
     @register_to_config
     def __init__(self,
                  model_type='t2v',
@@ -489,6 +493,8 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+        self.gradient_checkpointing = False
+
     def forward(
         self,
         x,
@@ -531,11 +537,13 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # [21, 30, 52] 对于 [81, 480, 832]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
+        # 将每个x的seq_len补齐到最大的seq_len长度
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
@@ -571,7 +579,21 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens)
 
         for block in self.blocks:
-            x = block(x, **kwargs)
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                def create_custom_forward(module):
+                    def custom_forward(*inputs, **kwargs):
+                        return module(*inputs, **kwargs)
+                    return custom_forward
+                
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block), 
+                    x, 
+                    use_reentrant=False,
+                    **kwargs
+                )
+            else:
+                x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)

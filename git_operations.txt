@@ -1,0 +1,36 @@
+将远程仓库克隆到本地后，同步到个人远程仓库进行开发的方法有以下几种：
+
+​​方法1：直接修改远程地址（适合全新开发）​​
+​​克隆原仓库​​：
+git clone <原仓库URL>
+cd <仓库目录>
+​​修改远程地址​​为你的个人仓库：
+git remote set-url origin <你的个人仓库URL>
+​​推送代码​​：
+git push -u origin main  # 或其他分支名
+​​适用场景​​：完全放弃与原仓库的同步，仅基于原仓库代码独立开发。
+
+​​方法2：添加多个远程仓库（推荐，保留同步能力）​​
+​​克隆原仓库​​：
+git clone <原仓库URL>
+cd <仓库目录>
+​​添加个人仓库为第二个远程​​（通常命名为 myrepo 或 origin）：
+git remote add myrepo <你的个人仓库URL>
+​​推送代码到个人仓库​​：
+git push -u myrepo main
+​​后续同步原仓库更新​​：
+git pull origin main   # 拉取原仓库更新
+git push myrepo main   # 同步到个人仓库
+​​优点​​：保留与原仓库的同步能力，适合需要持续合并上游更新的场景。
+
+​​方法3：Fork + 手动同步（GitHub/GitLab等平台）​​
+​​在平台（如GitHub）上Fork原仓库​​，生成你的个人副本。
+​​克隆你的Fork仓库​​：
+git clone <你的Fork仓库URL>
+​​添加原仓库为上游​​：
+git remote add upstream <原仓库URL>
+​​同步更新​​：
+git fetch upstream      # 获取原仓库更新
+git merge upstream/main # 合并到本地
+git push origin main    # 推送到你的Fork
+​​适用场景​​：开源协作开发，平台原生支持Fork工作流。

@@ -30,3 +30,7 @@ mt_1_3B.eps = 1e-6
 
 # motion transfer specific
 mt_1_3B.extract_timestep = 0  # 提取特定timestep的特征
+mt_1_3B.extract_layer_id = 15  # 提取特定layer的特征
+mt_1_3B.optimize_steps = 10  # 优化latents步数
+mt_1_3B.optimize_timestep_ratio = 0.2 # 优化latents的timestep比例   
+mt_1_3B.optimize_lr = 0.005  # 优化latents学习率
