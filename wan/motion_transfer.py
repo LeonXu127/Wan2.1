@@ -13,6 +13,7 @@ import time
 
 import torch
 import torch.amp as amp
+from torch.amp import GradScaler
 import torch.optim
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -376,6 +377,7 @@ class WanMT:
             latents = [x.clone().detach().requires_grad_(True) for x in latents]
 
             optimizer = torch.optim.AdamW(latents, lr=self.optimize_lr)
+            scaler = GradScaler()
 
             log_file = open("motion_transfer/logs/motion_transfer_loss.txt", "a")
             log_file.write(f"Timestep: {t.item()}\n")
@@ -402,8 +404,6 @@ class WanMT:
                 end_time = time.time()
                 print(f"cal_motion_flow time cost: {end_time - start_time}s")
 
-                # print(f"cur_flow.shape: {cur_flow.shape}, ref_motion_flow.shape: {self.ref_motion_flow.shape}")
-                # input("check cur_flow and ref_motion_flow")
                 loss = F.mse_loss(cur_flow, self.ref_motion_flow.to(cur_flow.device).to(dtype=cur_flow.dtype))
                 print(f"loss in step {i}: {loss.item()}")
                 # 将loss写入文件
@@ -411,10 +411,15 @@ class WanMT:
                 log_file.flush()  # 确保立即写入文件
 
                 start_time = time.time()
-                loss.backward()
+                # loss.backward()
+                scaler.scale(loss).backward()
                 end_time = time.time()
                 print(f"Backpropagation time cost: {end_time - start_time}s")
-                optimizer.step()
+                # optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
+                torch.cuda.empty_cache()
+                gc.collect()
         
         # 关闭日志文件
         log_file.write("\n")
