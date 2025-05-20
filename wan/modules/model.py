@@ -275,7 +275,7 @@ class WanAttentionBlock(nn.Module):
             nn.Linear(ffn_dim, dim))
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
     def forward(
         self,
@@ -334,7 +334,7 @@ class Head(nn.Module):
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim ** 0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, e):
         r"""
@@ -359,7 +359,8 @@ class MLPProj(torch.nn.Module):
             torch.nn.GELU(), torch.nn.Linear(in_dim, out_dim),
             torch.nn.LayerNorm(out_dim))
         if flf_pos_emb:  # NOTE: we only use this for `flf2v`
-            self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
+            self.emb_pos = nn.Parameter(
+                torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
 
     def forward(self, image_embeds):
         if hasattr(self, 'emb_pos'):
@@ -404,7 +405,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         Args:
             model_type (`str`, *optional*, defaults to 't2v'):
-                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video) or 'flf2v' (first-last-frame-to-video)
+                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video) or 'flf2v' (first-last-frame-to-video) or 'vace'
             patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
@@ -437,7 +438,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         super().__init__()
 
-        assert model_type in ['t2v', 'i2v', 'flf2v']
+        assert model_type in ['t2v', 'i2v', 'flf2v', 'vace']
         self.model_type = model_type
 
         self.patch_size = patch_size
